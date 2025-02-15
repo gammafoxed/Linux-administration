@@ -1,0 +1,214 @@
+# 🚀 **Полная установка Nextcloud в Podman с Nginx и MariaDB**
+Эта инструкция охватывает **установку Nextcloud** в **Podman**, использование **MariaDB, Redis (опционально)** и настройку **Nginx + HTTPS**.  
+📌 **Все данные Nextcloud будут храниться в `/nextcloud/`** для удобного резервного копирования.
+
+---
+
+## 📌 **1. Подготовка системы**
+### 🔹 **Обновите систему и установите Podman**
+```sh
+sudo apt update && sudo apt upgrade -y
+sudo apt install podman -y
+```
+
+### 🔹 **Создайте папку для хранения данных**
+```sh
+sudo mkdir -p /nextcloud/data /nextcloud/db /nextcloud/config /nextcloud/redis
+sudo chown -R 1000:1000 /nextcloud
+sudo chmod -R 755 /nextcloud
+```
+
+### 🔹 **Создайте пользовательскую сеть Podman**
+```sh
+podman network create nextcloud-net
+```
+
+---
+
+## 📌 **2. Установка базы данных MariaDB**
+### **Запустите контейнер MariaDB**
+```sh
+podman run -d --name nextcloud-db \
+  --network nextcloud-net \
+  -e MYSQL_ROOT_PASSWORD=rootpass \
+  -e MYSQL_DATABASE=nextcloud \
+  -e MYSQL_USER=nextcloud \
+  -e MYSQL_PASSWORD=securepass \
+  -v /nextcloud/db:/var/lib/mysql \
+  docker.io/library/mariadb:10.6
+```
+📌 **Пояснение**:
+- `MYSQL_ROOT_PASSWORD=rootpass` – пароль root MariaDB.
+- `MYSQL_DATABASE=nextcloud` – создаем базу данных.
+- `MYSQL_USER=nextcloud`, `MYSQL_PASSWORD=securepass` – создаем пользователя для Nextcloud.
+- `-v /nextcloud/db:/var/lib/mysql` – сохраняем данные на сервере.
+
+---
+
+## 📌 **3. Установка Nextcloud**
+```sh
+podman run -d --name nextcloud \
+  --network nextcloud-net \
+  -e MYSQL_HOST=nextcloud-db \
+  -e MYSQL_DATABASE=nextcloud \
+  -e MYSQL_USER=nextcloud \
+  -e MYSQL_PASSWORD=securepass \
+  -v /nextcloud/data:/var/www/html \
+  -v /nextcloud/config:/var/www/html/config \
+  -p 8080:80 \
+  docker.io/library/nextcloud:latest
+```
+📌 **Пояснение**:
+- Nextcloud подключается к **MariaDB** по сети `nextcloud-net`.
+- Данные Nextcloud хранятся в `/nextcloud/data` и `/nextcloud/config`.
+- Nextcloud работает на **порту 8080**.
+
+---
+
+## 📌 **4. Установка Redis (опционально, для кеширования)**
+```sh
+podman run -d --name nextcloud-redis \
+  --network nextcloud-net \
+  -v /nextcloud/redis:/data \
+  docker.io/library/redis
+```
+📌 **Добавьте Redis в конфиг Nextcloud (`config.php`)**:
+```php
+'memcache.local' => '\OC\Memcache\Redis',
+'redis' => [
+    'host' => 'nextcloud-redis',
+    'port' => 6379,
+    'timeout' => 0.0,
+],
+```
+
+---
+
+## 📌 **5. Настройка Nginx как Reverse Proxy**
+### **Установите Nginx**
+```sh
+sudo apt install nginx -y
+```
+
+### **Создайте конфигурацию Nextcloud**
+```sh
+sudo nano /etc/nginx/conf.d/nextcloud.conf
+```
+Добавьте:
+```nginx
+server {
+    listen 80;
+    server_name your.domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    client_max_body_size 512M;
+    location ~ /.well-known {
+        allow all;
+    }
+}
+```
+📌 **Перезапустите Nginx:**
+```sh
+sudo systemctl restart nginx
+```
+Проверьте конфигурацию:
+```sh
+sudo nginx -t
+```
+✅ **Если "syntax is ok", значит все работает.**
+
+---
+
+## 📌 **6. Настройка HTTPS (если Let's Encrypt уже работает)**
+### **Используйте уже установленные сертификаты**
+Откройте конфигурацию Nginx:
+```sh
+sudo nano /etc/nginx/conf.d/nextcloud.conf
+```
+Измените ее так, чтобы включить HTTPS:
+```nginx
+server {
+    listen 80;
+    server_name your.domain.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your.domain.com;
+
+    ssl_certificate /etc/letsencrypt/live/your.domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your.domain.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    client_max_body_size 512M;
+    location ~ /.well-known {
+        allow all;
+    }
+}
+```
+📌 **Перезапустите Nginx:**
+```sh
+sudo systemctl restart nginx
+```
+
+---
+
+## 📌 **7. Автозапуск контейнеров**
+Чтобы Nextcloud, MariaDB и Redis запускались автоматически после перезагрузки:
+```sh
+podman generate systemd --name nextcloud-db > ~/.config/systemd/user/nextcloud-db.service
+podman generate systemd --name nextcloud > ~/.config/systemd/user/nextcloud.service
+podman generate systemd --name nextcloud-redis > ~/.config/systemd/user/nextcloud-redis.service
+
+systemctl --user enable nextcloud-db.service
+systemctl --user enable nextcloud.service
+systemctl --user enable nextcloud-redis.service
+```
+
+---
+
+## 📌 **8. Финальная проверка**
+1️⃣ Откройте браузер и перейдите на:
+   ```
+   https://your.domain.com
+   ```
+   или
+   ```
+   http://your-vps-ip
+   ```
+
+2️⃣ Создайте администратора **(логин/пароль)**.
+
+3️⃣ Готово! 🚀 Теперь Nextcloud полностью настроен!
+
+---
+
+## 🔥 **Итог**
+✅ **Nextcloud запущен в Podman**  
+✅ **MariaDB используется как база данных**  
+✅ **Redis для кеширования (опционально)**  
+✅ **Nginx с HTTPS как Reverse Proxy**  
+✅ **Все данные хранятся в `/nextcloud/`**  
+✅ **Автозапуск контейнеров**  
+
+Теперь у вас **Nextcloud с полной безопасностью**!  
+Если что-то не работает — спрашивайте! 🚀🔥
